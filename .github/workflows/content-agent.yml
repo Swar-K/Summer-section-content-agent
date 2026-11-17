@@ -1,0 +1,145 @@
+name: Summer Section Content Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      article_url:
+        description: "Article URL. Leave blank for a video-only run (or, with no video either, to auto-pick the next unused WordPress article)"
+        required: false
+        default: ""
+        type: string
+      video_url:
+        description: "YouTube video URL, long video or Short. Leave blank for an article-only run"
+        required: false
+        default: ""
+        type: string
+      video_notes:
+        description: "Optional: paste the video script, transcript or key points (best fallback if YouTube blocks the transcript)"
+        required: false
+        default: ""
+        type: string
+      video_notes_file:
+        description: "Optional: path of a script file in this repo, e.g. scripts/my-video.txt"
+        required: false
+        default: ""
+        type: string
+      destination_url:
+        description: "Video-only runs: where pins and posts should link (default: the YouTube video itself)"
+        required: false
+        default: ""
+        type: string
+      video_file:
+        description: "Optional: your source MP4 (repo path or https link) so Reel/Short scenes can use real footage"
+        required: false
+        default: ""
+        type: string
+      make_videos:
+        description: "Also build the Video Pin, Reel and Short as MP4 files"
+        required: false
+        default: true
+        type: boolean
+      pins_per_article:
+        description: "How many pins to create (1-15)"
+        required: false
+        default: "10"
+        type: string
+      use_ai_backgrounds:
+        description: "Use AI-generated background imagery when OPENAI_API_KEY is configured"
+        required: false
+        default: true
+        type: boolean
+  # Optional daily auto-run (blank article = next unused article). Uncomment to enable.
+  # schedule:
+  #   - cron: "0 3 * * *"   # 03:00 UTC = 9:00 AM Bangladesh time
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: content-agent
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Make sure ffmpeg is available
+        run: command -v ffmpeg >/dev/null || (sudo apt-get update -y && sudo apt-get install -y ffmpeg)
+
+      - name: Generate campaign
+        id: gen
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ARTICLE_URL: ${{ inputs.article_url }}
+          VIDEO_URL: ${{ inputs.video_url }}
+          DESTINATION_URL: ${{ inputs.destination_url }}
+          VIDEO_FILE: ${{ inputs.video_file }}
+          MAKE_VIDEOS: ${{ inputs.make_videos }}
+          TTS_VOICE: ${{ vars.TTS_VOICE }}
+          USE_TTS: ${{ vars.USE_TTS }}
+          VIDEO_NOTES: ${{ inputs.video_notes }}
+          VIDEO_NOTES_FILE: ${{ inputs.video_notes_file }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          INCLUDE_VIDEO_LINK: ${{ vars.INCLUDE_VIDEO_LINK }}
+          USE_AI_BACKGROUNDS: ${{ inputs.use_ai_backgrounds }}
+          PINS_PER_ARTICLE: ${{ inputs.pins_per_article }}
+          WP_SITE_URL: ${{ vars.WP_SITE_URL }}
+          WP_CATEGORY_ID: ${{ vars.WP_CATEGORY_ID }}
+          SEASON: ${{ vars.SEASON }}
+          DISCLOSURE: ${{ vars.DISCLOSURE }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTPUT_DIR: output
+        run: |
+          set +e
+          python -m agent.main
+          code=$?
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::Some quality checks failed. See quality_report.json and the review issue."
+            exit 0
+          fi
+          exit $code
+
+      - name: Upload campaign (pins, cards, videos, scripts, editor.html, summary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: summer-section-campaign
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit draft
+        if: steps.gen.outputs.draft_id != ''
+        run: |
+          git config user.name "content-agent"
+          git config user.email "content-agent@users.noreply.github.com"
+          git add drafts
+          git commit -m "Add draft ${{ steps.gen.outputs.draft_id }}"
+          git pull --rebase
+          git push
+
+      - name: Open review issue
+        if: steps.gen.outputs.draft_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_ID: ${{ steps.gen.outputs.draft_id }}
+          TITLE: ${{ steps.gen.outputs.title }}
+        run: |
+          gh label create approved --color 0E8A16 --force
+          gh label create campaign-draft --color 1D76DB --force
+          gh issue create --title "Campaign: $TITLE" --body-file "drafts/$DRAFT_ID/issue.md" --label campaign-draft

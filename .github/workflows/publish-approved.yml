@@ -1,0 +1,67 @@
+name: Publish approved Facebook post
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: content-agent
+
+jobs:
+  publish:
+    if: github.event.label.name == 'approved' && contains(github.event.issue.labels.*.name, 'campaign-draft')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Find draft id
+        id: find
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          ID=$(printf '%s' "$ISSUE_BODY" | grep -oP '(?<=draft-id: )[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9a-f]{8}' | head -1 || true)
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to Facebook
+        id: pub
+        if: steps.find.outputs.id != ''
+        env:
+          DRAFT_ID: ${{ steps.find.outputs.id }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+        run: python -m agent.publish_facebook
+
+      - name: Save status
+        if: steps.pub.outcome == 'success'
+        run: |
+          git config user.name "content-agent"
+          git config user.email "content-agent@users.noreply.github.com"
+          git add drafts
+          git diff --staged --quiet || git commit -m "Mark draft ${{ steps.find.outputs.id }} published"
+          git pull --rebase
+          git push
+
+      - name: Comment and close
+        if: steps.pub.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POST_ID: ${{ steps.pub.outputs.post_id }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body "Published to Facebook. Post ID: $POST_ID"
+          gh issue close ${{ github.event.issue.number }}
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue comment ${{ github.event.issue.number }} --body "Publishing failed. Check the workflow run logs, fix the problem, then remove and re-add the approved label."
