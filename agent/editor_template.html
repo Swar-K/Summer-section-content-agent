@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Summer Section editor</title>
+<style>
+__FONT_CSS__
+:root{--ink:#34332F;--muted:#77736C;--bg:#F5EFE6;--cream:#EFE5D7;--line:#D8C7AE;--sage:#A8B5A0;--blush:#E8CFCB;--warn:#B3541E}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 "EditorSans","DejaVu Sans",system-ui,"Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}
+header{display:flex;gap:8px;align-items:center;padding:10px 16px;background:var(--sage);flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0 auto 0 0}
+button,.btn{font:inherit;border:1px solid var(--ink);background:#fff;color:var(--ink);padding:6px 12px;border-radius:8px;cursor:pointer}
+button:hover,.btn:hover{background:var(--cream)}
+button.primary{background:var(--ink);color:#fff}
+main{display:grid;grid-template-columns:132px minmax(300px,500px) minmax(320px,1fr);gap:16px;padding:16px;align-items:start}
+#list{display:flex;flex-direction:column;gap:10px;max-height:calc(100vh - 90px);overflow:auto;position:sticky;top:64px}
+.thumb{border:2px solid transparent;border-radius:8px;background:#fff;padding:4px;cursor:pointer;text-align:center;font-size:12px}
+.thumb canvas{width:100%;height:auto;display:block;border-radius:4px}
+.thumb.active{border-color:var(--ink)}
+.thumb.changed::after{content:"edited";display:block;color:var(--warn);font-size:11px}
+#stage{position:sticky;top:64px}
+#cv{width:100%;height:auto;background:#fff;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.15)}
+#panel{background:#fff;border-radius:12px;padding:14px 16px;border:1px solid var(--line)}
+#panel h2{font-size:15px;margin:14px 0 6px;padding-top:8px;border-top:1px solid var(--line)}
+#panel h2:first-child{border-top:0;margin-top:0;padding-top:0}
+label{display:block;font-size:12px;color:var(--muted);margin:8px 0 2px}
+input[type=text],textarea,select{width:100%;font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+textarea{resize:vertical}
+input[type=range]{width:100%}
+.row{display:flex;gap:10px}.row>*{flex:1}
+.count{float:right;font-size:11px}.count.over{color:var(--warn);font-weight:700}
+.chip{display:inline-block;font-size:11px;padding:1px 8px;border-radius:10px;background:var(--cream);margin-left:6px}
+.chip.new{background:var(--blush)}
+.warn{color:var(--warn);font-size:12px;margin-top:6px}
+.note{color:var(--muted);font-size:12px;margin:6px 0}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+@media(max-width:900px){main{grid-template-columns:1fr}#list{flex-direction:row;position:static;max-height:none}.thumb{min-width:90px}#stage{position:static}}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Summer Section editor</h1>
+  <button id="btnEdits" class="primary" title="Save your changes so the Re-render workflow can apply them">Download edits.json</button>
+  <label class="btn" style="margin:0;color:var(--ink)">Load edits.json<input id="fileEdits" type="file" accept="application/json" hidden></label>
+  <button id="btnAll">Download all PNGs</button>
+</header>
+<main>
+  <aside id="list"></aside>
+  <section id="stage"><canvas id="cv" width="1000" height="1500"></canvas><div class="note" id="status"></div></section>
+  <section id="panel"></section>
+</main>
+<script>
+const DATA = /*__DATA__*/null;
+(function () {
+"use strict";
+const ASC = 0.929;                         // DejaVu ascent / em, the same offset Pillow uses to place text
+const NO_GLYPH = /[\u{1F000}-\u{1FFFF}\u2190-\u21FF\u2300-\u23FF\u2600-\u27BF\u2B00-\u2BFF\uFE00-\uFE0F\u200D]/gu;
+const COLORS = DATA.brand.colors;
+const COLOR_KEYS = ["ivory", "cream", "champagne", "sage", "blush"];
+const IMAGES = {};
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const clean = (t) => String(t == null ? "" : t).replace(NO_GLYPH, "").replace(/\s+/g, " ").trim();
+const fontStr = (size, bold) => (bold ? "700 " : "400 ") + size + 'px "EditorSans","DejaVu Sans",Verdana,sans-serif';
+
+function measure(ctx, text, f) { ctx.font = f; return Math.ceil(ctx.measureText(text).actualBoundingBoxRight || 0); }
+function wrap(ctx, text, f, maxW) {
+  const lines = []; let cur = "";
+  for (const w of String(text || "").split(/\s+/).filter(Boolean)) {
+    const t = (cur + " " + w).trim();
+    if (measure(ctx, t, f) <= maxW) cur = t; else { if (cur) lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+function fitText(ctx, text, sizes, maxW, maxLines, bold) {
+  let last = null;
+  for (const size of sizes) {
+    const f = fontStr(size, bold), lines = wrap(ctx, text, f, maxW);
+    const tooWide = lines.some((l) => measure(ctx, l, f) > maxW);
+    last = { f, size, lines, clipped: false };
+    if (lines.length <= maxLines && !tooWide) return last;
+  }
+  last.lines = last.lines.slice(0, maxLines); last.clipped = true;
+  return last;
+}
+function txt(ctx, s, x, y, size, bold, color) {
+  ctx.font = fontStr(size, bold); ctx.fillStyle = color; ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  ctx.fillText(s, x, y + size * ASC);
+}
+function rrect(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function ellipse(ctx, x0, y0, x1, y1, fill) {
+  ctx.beginPath(); ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, 0, Math.PI * 2);
+  ctx.fillStyle = fill; ctx.fill();
+}
+function hline(ctx, x0, x1, y, w, color) { ctx.fillStyle = color; ctx.fillRect(x0, y - w / 2, x1 - x0, w); }
+
+// ---------------------------------------------------------------- Pinterest pin (mirrors agent/image_designer.py)
+function renderPin(cv, pin) {
+  const W = 1000, H = 1500; cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d"); const st = pin.style; const C = COLORS;
+  const img = st.background.indexOf("asset:") === 0 ? IMAGES[st.background.slice(6)] : null;
+  if (img) {
+    const r = Math.max(W / img.width, H / img.height), w = img.width * r, h = img.height * r;
+    ctx.save(); try { ctx.filter = "blur(1px)"; } catch (e) {} ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h); ctx.restore();
+    ctx.fillStyle = "rgba(245,239,230," + (st.overlay / 255) + ")"; ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.fillStyle = C[st.base]; ctx.fillRect(0, 0, W, H);
+    ellipse(ctx, 650, -100, 1150, 400, C[st.accent] + "55");
+    ellipse(ctx, -180, 1030, 380, 1590, C.blush + "88");
+  }
+  const margin = 82; let labelY;
+  const v = Number(st.template) - 1;
+  if (v === 0) { ctx.strokeStyle = C.champagne; ctx.lineWidth = 5; rrect(ctx, 47.5, 47.5, 905, 1405, 34); ctx.stroke(); labelY = 180; }
+  else if (v === 1) { rrect(ctx, 65, 70, 870, 1360, 28); ctx.fillStyle = "#F5EFE6"; ctx.fill(); labelY = 150; }
+  else { ctx.fillStyle = C[st.accent]; ctx.fillRect(0, 0, W, 260); ctx.fillStyle = C.cream; ctx.fillRect(0, 1180, W, H - 1180); labelY = 330; }
+  txt(ctx, "SUMMER SECTION", margin, labelY, 27, true, C.ink);
+  hline(ctx, margin, W - margin, labelY + 55, 3, C.champagne);
+  const scale = Number(st.text_scale);
+  const headline = clean(pin.headline) || "A Helpful Buying Guide";
+  const base = headline.length < 30 ? [76, 64, 54, 46] : [64, 54, 46];
+  const hf = fitText(ctx, headline, base.map((x) => Math.max(20, Math.floor(x * scale))), W - margin * 2, 4, true);
+  let y = labelY + 125;
+  for (const line of hf.lines) { txt(ctx, line, margin, y, hf.size, true, C.ink); y += Math.floor(hf.size * 1.24); }
+  let clipped = hf.clipped;
+  const sub = clean(pin.subheadline);
+  if (sub) {
+    y += 18;
+    const sf = fitText(ctx, sub, [34, 30, 26].map((x) => Math.max(16, Math.floor(x * scale))), W - margin * 2, 3, false);
+    clipped = clipped || sf.clipped;
+    for (const line of sf.lines) { txt(ctx, line, margin, y, sf.size, false, C.muted); y += Math.floor(sf.size * 1.4); }
+  }
+  hline(ctx, margin, W - margin, 1250, 3, C.champagne);
+  txt(ctx, DATA.cta_label, margin, 1285, 25, false, C.ink);
+  txt(ctx, DATA.brand.domain, margin, 1337, 22, false, C.muted);
+  return { clipped };
+}
+
+// ---------------------------------------------------------------- Facebook / Instagram card (mirrors agent/facebook_card.py)
+function renderCard(cv, block, footer) {
+  const W = 1080, H = 1350; cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d"); const C = COLORS; const accent = C[block.band] || C.sage; const margin = 80;
+  ctx.fillStyle = C.ivory; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = accent; ctx.fillRect(0, 0, W, 150);
+  txt(ctx, String(DATA.brand.name).toUpperCase(), margin, 56, 32, true, C.ink);
+  let clipped = false;
+  const hf = fitText(ctx, clean(block.headline) || "Helpful buying tips", [84, 72, 62, 54], W - 2 * margin, 3, true);
+  clipped = clipped || hf.clipped;
+  let y = 205;
+  for (const line of hf.lines) { txt(ctx, line, margin, y, hf.size, true, C.ink); y += Math.floor(hf.size * 1.24); }
+  let top = 560;
+  (block.tips || []).slice(0, 3).forEach((tip, i) => {
+    rrect(ctx, 60, top, W - 120, 190, 32); ctx.fillStyle = C.cream; ctx.fill();
+    ctx.strokeStyle = C.champagne; ctx.lineWidth = 3; ctx.stroke();
+    ellipse(ctx, 92, top + 55, 172, top + 135, accent);
+    ctx.font = fontStr(44, true); ctx.fillStyle = C.ink; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(i + 1), 132, top + 97); ctx.textAlign = "left";
+    const tf = fitText(ctx, clean(tip), [38, 34, 30, 27], 785, 3, false);
+    clipped = clipped || tf.clipped;
+    const total = tf.lines.length * Math.floor(tf.size * 1.3); let ty = top + (190 - total) / 2;
+    for (const line of tf.lines) { txt(ctx, line, 205, ty, tf.size, false, C.ink); ty += Math.floor(tf.size * 1.3); }
+    top += 218;
+  });
+  hline(ctx, margin, W - margin, 1235, 3, C.champagne);
+  txt(ctx, footer, margin, 1255, 27, false, C.ink);
+  txt(ctx, DATA.brand.domain, margin, 1295, 24, false, C.muted);
+  return { clipped };
+}
+
+// ---------------------------------------------------------------- state
+const items = [];
+DATA.pins.forEach((p) => items.push({ kind: "pin", id: "pin_" + String(p.number).padStart(2, "0"), label: "Pin " + p.number, data: clone(p), orig: clone(p) }));
+if (DATA.facebook) items.push({ kind: "fb", id: "facebook_card", label: "Facebook", data: clone(DATA.facebook), orig: clone(DATA.facebook) });
+if (DATA.instagram) items.push({ kind: "ig", id: "instagram_card", label: "Instagram", data: clone(DATA.instagram), orig: clone(DATA.instagram) });
+let active = 0, clippedNow = false;
+const $ = (s) => document.querySelector(s);
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const changed = (it) => !same(it.data, it.orig);
+
+function draw(it, cv) {
+  if (it.kind === "pin") return renderPin(cv, it.data);
+  return renderCard(cv, it.data, it.kind === "fb" ? DATA.footers.fb : DATA.footers.ig);
+}
+function redrawMain() { clippedNow = draw(items[active], $("#cv")).clipped; $("#status").textContent = clippedNow ? "" : ""; updateWarn(); updateThumb(active); }
+function thumbFor(i) { return document.querySelector('.thumb[data-i="' + i + '"]'); }
+let thumbTimer = {};
+function updateThumb(i) {
+  clearTimeout(thumbTimer[i]);
+  thumbTimer[i] = setTimeout(() => {
+    const off = document.createElement("canvas"); draw(items[i], off);
+    const t = thumbFor(i); if (!t) return; const c = t.querySelector("canvas");
+    c.width = 160; c.height = Math.round(160 * off.height / off.width); c.getContext("2d").drawImage(off, 0, 0, c.width, c.height);
+    t.classList.toggle("changed", changed(items[i]));
+  }, 120);
+}
+function buildList() {
+  const list = $("#list"); list.innerHTML = "";
+  items.forEach((it, i) => {
+    const d = document.createElement("div"); d.className = "thumb" + (i === active ? " active" : ""); d.dataset.i = i;
+    d.innerHTML = "<canvas></canvas><div>" + it.label + "</div>";
+    d.onclick = () => select(i); list.appendChild(d); updateThumb(i);
+  });
+}
+function select(i) {
+  active = i; document.querySelectorAll(".thumb").forEach((t) => t.classList.toggle("active", Number(t.dataset.i) === i));
+  buildPanel(); redrawMain();
+}
+function updateWarn() { const w = $("#warn"); if (w) w.textContent = clippedNow ? "Some text does not fit and is cut off. Shorten it or lower the text size." : ""; }
+
+// ---------------------------------------------------------------- form
+function el(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function field(panel, label, kind, value, onInput, opts) {
+  opts = opts || {};
+  const wrapper = el("<div></div>");
+  const counter = (opts.limit || kind === "range") ? '<span class="count"></span>' : "";
+  wrapper.innerHTML = "<label>" + label + counter + "</label>";
+  let input;
+  if (kind === "textarea") { input = el('<textarea rows="' + (opts.rows || 2) + '"></textarea>'); input.value = value; }
+  else if (kind === "select") { input = el("<select></select>"); opts.options.forEach(([v, t]) => { const o = el("<option></option>"); o.value = v; o.textContent = t; input.appendChild(o); }); input.value = value; }
+  else if (kind === "range") { input = el('<input type="range" min="' + opts.min + '" max="' + opts.max + '" step="' + opts.step + '">'); input.value = value; }
+  else { input = el('<input type="text">'); input.value = value; if (opts.list) input.setAttribute("list", opts.list); }
+  const cnt = wrapper.querySelector(".count");
+  const sync = () => {
+    if (!cnt) return;
+    if (kind === "range") { cnt.textContent = opts.fmt ? opts.fmt(input.value) : input.value; return; }
+    cnt.textContent = input.value.length + " / " + opts.limit; cnt.classList.toggle("over", input.value.length > opts.limit);
+  };
+  input.addEventListener("input", () => { sync(); onInput(input.value, input); });
+  wrapper.appendChild(input); panel.appendChild(wrapper); sync();
+  return { wrapper, input };
+}
+function heading(panel, t) { panel.appendChild(el("<h2>" + t + "</h2>")); }
+
+function buildPanel() {
+  const panel = $("#panel"); panel.innerHTML = ""; const it = items[active]; const d = it.data;
+  const touch = () => { redrawMain(); };
+  if (it.kind === "pin") {
+    heading(panel, "Text on the image");
+    field(panel, "Headline", "textarea", d.headline, (v) => { d.headline = v; touch(); });
+    field(panel, "Supporting line (optional)", "textarea", d.subheadline || "", (v) => { d.subheadline = v; touch(); });
+    heading(panel, "Look");
+    const s = d.style;
+    const bgOpts = [["none", "No photo (brand colour)"]].concat(Object.keys(DATA.backgrounds).sort().map((n) => ["asset:" + n, "Photo " + n.replace(/^bg_|\.jpg$/g, "")]));
+    if (s.background !== "none" && !DATA.backgrounds[s.background.replace("asset:", "")]) bgOpts.push([s.background, s.background]);
+    field(panel, "Template", "select", String(s.template), (v) => { s.template = Number(v); touch(); }, { options: [["1", "1 · Framed"], ["2", "2 · Card"], ["3", "3 · Header band"]] });
+    field(panel, "Background", "select", s.background, (v) => { s.background = v; touch(); }, { options: bgOpts });
+    const keyOpts = COLOR_KEYS.map((k) => [k, k]);
+    const row = el('<div class="row"></div>'); panel.appendChild(row);
+    const a = field(row, "Header / accent colour", "select", s.accent, (v) => { s.accent = v; touch(); }, { options: keyOpts });
+    const b = field(row, "Base colour (no photo)", "select", s.base, (v) => { s.base = v; touch(); }, { options: keyOpts });
+    field(panel, "Photo overlay (higher = paler)", "range", s.overlay, (v) => { s.overlay = Number(v); touch(); }, { min: 0, max: 255, step: 5, fmt: (v) => Math.round(v / 2.55) + "%" });
+    field(panel, "Text size", "range", s.text_scale, (v) => { s.text_scale = Number(v); touch(); }, { min: 0.6, max: 1.4, step: 0.05, fmt: (v) => Math.round(v * 100) + "%" });
+    heading(panel, "Pinterest details");
+    field(panel, "Pin title", "text", d.title || "", (v) => { d.title = v; touch(); }, { limit: 100 });
+    field(panel, "Description", "textarea", d.description || "", (v) => { d.description = v; touch(); }, { rows: 5, limit: 800 });
+    const bf = field(panel, 'Board <span class="chip" id="chip"></span>', "text", d.board || "", (v) => { d.board = v; chip(); touch(); }, { list: "boardlist" });
+    field(panel, "Alt text", "textarea", d.alt_text || "", (v) => { d.alt_text = v; touch(); }, { limit: 150 });
+    const dl = el('<datalist id="boardlist"></datalist>'); DATA.boards.forEach((n) => { const o = el("<option></option>"); o.value = n; dl.appendChild(o); }); panel.appendChild(dl);
+    function chip() {
+      const c = $("#chip"); const known = DATA.boards.some((n) => n.toLowerCase() === String(d.board || "").trim().toLowerCase());
+      if (!DATA.boards.length) { c.textContent = "no boards configured"; c.className = "chip"; return; }
+      c.textContent = known ? "existing board" : "new board: create it first"; c.className = "chip" + (known ? "" : " new");
+    }
+    chip();
+  } else {
+    heading(panel, it.kind === "fb" ? "Facebook card and post" : "Instagram card and post");
+    field(panel, "Card headline", "textarea", d.headline, (v) => { d.headline = v; touch(); });
+    for (let i = 0; i < 3; i++) field(panel, "Point " + (i + 1), "textarea", d.tips[i] || "", (v) => { d.tips[i] = v; touch(); });
+    field(panel, "Card accent colour", "select", d.band || "sage", (v) => { d.band = v; touch(); }, { options: COLOR_KEYS.map((k) => [k, k]) });
+    heading(panel, it.kind === "fb" ? "Post text" : "Caption");
+    const key = it.kind === "fb" ? "post" : "caption";
+    field(panel, it.kind === "fb" ? "Post (link, disclosure and hashtags are added automatically)" : "Caption", "textarea", d[key] || "", (v) => { d[key] = v; }, { rows: 6, limit: it.kind === "fb" ? 450 : 900 });
+    field(panel, "Hashtags (separate with spaces)", "text", (d.hashtags || []).join(" "), (v) => { d.hashtags = v.split(/\s+/).filter(Boolean); });
+    if (it.kind === "ig") field(panel, "Alt text", "textarea", d.alt_text || "", (v) => { d.alt_text = v; }, { limit: 150 });
+  }
+  panel.appendChild(el('<div class="warn" id="warn"></div>'));
+  const act = el('<div class="actions"></div>');
+  const bp = el("<button>Download this PNG</button>"); bp.onclick = () => download(items[active]);
+  const br = el("<button>Reset this item</button>"); br.onclick = () => { it.data = clone(it.orig); buildPanel(); redrawMain(); };
+  act.appendChild(bp); act.appendChild(br); panel.appendChild(act);
+  panel.appendChild(el('<p class="note">Changes stay in this page. Download the PNG for a quick fix, or download edits.json and run the Re-render workflow to update the whole campaign.</p>'));
+}
+
+// ---------------------------------------------------------------- export
+function save(blob, name) { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500); }
+function download(it) { const c = document.createElement("canvas"); draw(it, c); c.toBlob((b) => save(b, it.id + "_edited.png"), "image/png"); }
+function editsObject() {
+  const out = { version: 1, slug: DATA.slug, pins: {} };
+  items.forEach((it) => {
+    if (!changed(it)) return;
+    const diff = {}; Object.keys(it.data).forEach((k) => { if (!same(it.data[k], it.orig[k])) diff[k] = it.data[k]; });
+    if (it.kind === "pin") out.pins[String(it.data.number)] = diff; else out[it.kind === "fb" ? "facebook" : "instagram"] = diff;
+  });
+  return out;
+}
+$("#btnEdits").onclick = () => save(new Blob([JSON.stringify(editsObject(), null, 2)], { type: "application/json" }), "edits.json");
+$("#btnAll").onclick = () => items.forEach((it, i) => setTimeout(() => download(it), i * 350));
+$("#fileEdits").onchange = (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then((t) => {
+    const ed = JSON.parse(t);
+    items.forEach((it) => {
+      const patch = it.kind === "pin" ? (ed.pins || {})[String(it.data.number)] : ed[it.kind === "fb" ? "facebook" : "instagram"];
+      if (patch) Object.keys(patch).forEach((k) => { it.data[k] = patch[k]; });
+    });
+    buildList(); buildPanel(); redrawMain();
+  }).catch(() => alert("That file is not a valid edits.json"));
+};
+
+// ---------------------------------------------------------------- start
+function loadImages() {
+  return Promise.all(Object.keys(DATA.backgrounds).map((n) => new Promise((res) => {
+    const im = new Image(); im.onload = () => { IMAGES[n] = im; res(); }; im.onerror = () => res(); im.src = DATA.backgrounds[n];
+  })));
+}
+async function start() {
+  try { await document.fonts.load('700 30px "EditorSans"'); await document.fonts.load('400 30px "EditorSans"'); } catch (e) {}
+  await loadImages();
+  $("#title").textContent = DATA.brand.name + " editor · " + DATA.slug;
+  buildList(); select(0);
+  window.__editor = { items, renderPin, renderCard, IMAGES, editsObject, DATA, select, redrawMain, buildPanel };
+  window.__editorReady = true;
+}
+start();
+})();
+</script>
+</body>
+</html>
