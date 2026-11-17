@@ -1,0 +1,115 @@
+name: Re-render edited campaign
+
+# Applies edits made in editor.html (edits.json) to a finished campaign. No Groq calls: only the changed pins and
+# cards are redrawn, the Video Pin is rebuilt, and the Facebook draft that publishing reads is updated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID of the 'Summer Section Content Agent' run that made the campaign (the number in that run's URL)"
+        required: true
+        type: string
+      edits_json:
+        description: "Paste the contents of edits.json (or use edits_file)"
+        required: false
+        default: ""
+        type: string
+      edits_file:
+        description: "Or: path of an edits.json committed to this repo, e.g. edits/my-article.json"
+        required: false
+        default: ""
+        type: string
+      rebuild_video_pin:
+        description: "Rebuild video_pin.mp4 from the updated pins"
+        required: false
+        default: true
+        type: boolean
+      issue_number:
+        description: "Optional: review issue number, to post the updated Facebook text there"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+concurrency:
+  group: content-agent
+
+jobs:
+  rerender:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          command -v ffmpeg >/dev/null || (sudo apt-get update -y && sudo apt-get install -y ffmpeg)
+
+      - name: Download the original campaign
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: gh run download "$RUN_ID" --name summer-section-campaign --dir output
+
+      - name: Prepare edits
+        env:
+          EDITS_JSON: ${{ inputs.edits_json }}
+          EDITS_FILE: ${{ inputs.edits_file }}
+        run: |
+          if [ -n "$EDITS_FILE" ]; then
+            cp "$EDITS_FILE" edits.json
+          elif [ -n "$EDITS_JSON" ]; then
+            printf '%s' "$EDITS_JSON" > edits.json
+          else
+            echo "::error::Give edits_json or edits_file"; exit 1
+          fi
+          python - <<'EOF'
+          import json, pathlib
+          edits = json.load(open("edits.json"))
+          slug = edits.get("slug", "")
+          folders = [p for p in pathlib.Path("output").iterdir() if p.is_dir()]
+          match = [p for p in folders if p.name == slug] or (folders if len(folders) == 1 else [])
+          if not match:
+              raise SystemExit(f"Could not find the campaign folder for '{slug}' in the downloaded artifact")
+          open("campaign_path.txt", "w").write(str(match[0]))
+          EOF
+
+      - name: Re-render
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.rebuild_video_pin }}" != "true" ]; then FLAGS="--no-videos"; fi
+          python -m agent.rerender --campaign "$(cat campaign_path.txt)" --edits edits.json --drafts drafts $FLAGS
+
+      - name: Upload the updated campaign
+        uses: actions/upload-artifact@v4
+        with:
+          name: summer-section-campaign-edited
+          path: output/
+          retention-days: 14
+
+      - name: Commit the updated Facebook draft
+        run: |
+          git config user.name "content-agent"
+          git config user.email "content-agent@users.noreply.github.com"
+          git add drafts
+          git diff --staged --quiet || (git commit -m "Update draft after edits" && git pull --rebase && git push)
+
+      - name: Comment on the review issue
+        if: inputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue_number }}
+        run: |
+          gh issue comment "$ISSUE" --body "Edits applied. The updated pins, cards and videos are in the \`summer-section-campaign-edited\` artifact of this run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If you changed the Facebook post, publishing now uses the updated text and card."
